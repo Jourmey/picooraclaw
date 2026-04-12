@@ -1,20 +1,17 @@
 package oracle
 
-// validIdentifierRe matches safe Oracle SQL identifiers: letters, digits, underscores, dollar signs.
-// Must start with a letter or underscore.
-//var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_$#]*$`)
+import "fmt"
 
-// validateSQLIdentifier checks that a string is a safe Oracle SQL identifier
-// (table name, column name, model name, etc.) to prevent SQL injection.
+// validateSQLIdentifier checks that a string is a safe SQL identifier (alphanumeric + underscore only).
 func validateSQLIdentifier(s string) error {
-	//if s == "" {
-	//	return fmt.Errorf("SQL identifier must not be empty")
-	//}
-	//if len(s) > 128 {
-	//	return fmt.Errorf("SQL identifier too long (max 128 chars): %q", s)
-	//}
-	//if !validIdentifierRe.MatchString(s) {
-	//	return fmt.Errorf("invalid SQL identifier %q: only letters, digits, _, $, # allowed and must start with letter or _", s)
-	//}
+	if s == "" {
+		return fmt.Errorf("empty SQL identifier")
+	}
+	for i, r := range s {
+		if r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (i > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return fmt.Errorf("invalid character %q in SQL identifier %q", r, s)
+	}
 	return nil
 }
