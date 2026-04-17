@@ -262,6 +262,11 @@ func (es *EmbeddingService) ModelName() string {
 	return es.modelName
 }
 
+// Embed is a wrapper around EmbedText that matches the storage.EmbeddingService interface.
+func (es *EmbeddingService) Embed(text string) ([]float32, error) {
+	return es.EmbedText(text)
+}
+
 // Mode returns the embedding mode ("onnx" or "api").
 func (es *EmbeddingService) Mode() string {
 	return es.mode

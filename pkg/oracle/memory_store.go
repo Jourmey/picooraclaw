@@ -7,17 +7,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jasperan/picooraclaw/pkg/agent"
 	"github.com/jasperan/picooraclaw/pkg/logger"
 )
-
-// MemoryRecallResult represents a single recalled memory with similarity score.
-type MemoryRecallResult struct {
-	MemoryID   string  `json:"memory_id"`
-	Text       string  `json:"text"`
-	Importance float64 `json:"importance"`
-	Category   string  `json:"category"`
-	Score      float64 `json:"score"`
-}
 
 // MemoryStore implements MemoryStoreInterface and OracleMemoryStore backed by Oracle.
 type MemoryStore struct {
@@ -28,21 +20,29 @@ type MemoryStore struct {
 }
 
 // NewMemoryStore creates a new Oracle-backed memory store.
-func NewMemoryStore(db *sql.DB, agentID string, embedding *EmbeddingService) *MemoryStore {
-	modelName := ""
+// The embedding parameter can be *EmbeddingService or any type that has compatible methods.
+func NewMemoryStore(db *sql.DB, agentID string, embedding interface{}) *MemoryStore {
+	var embSvc *EmbeddingService
+	var modelName string
+
+	// Try to cast to *EmbeddingService if provided
 	if embedding != nil {
-		modelName = embedding.ModelName()
-	}
-	if modelName != "" {
-		if err := validateSQLIdentifier(modelName); err != nil {
-			logger.WarnCF("oracle", "Invalid model name for MemoryStore, disabling embedding SQL", map[string]interface{}{"error": err.Error(), "modelName": modelName})
-			modelName = ""
+		if es, ok := embedding.(*EmbeddingService); ok {
+			embSvc = es
+			modelName = es.ModelName()
+			if modelName != "" {
+				if err := validateSQLIdentifier(modelName); err != nil {
+					logger.WarnCF("oracle", "Invalid model name for MemoryStore, disabling embedding SQL", map[string]interface{}{"error": err.Error(), "modelName": modelName})
+					modelName = ""
+				}
+			}
 		}
 	}
+
 	return &MemoryStore{
 		db:        db,
 		agentID:   agentID,
-		embedding: embedding,
+		embedding: embSvc,
 		modelName: modelName,
 	}
 }
@@ -273,7 +273,7 @@ func (ms *MemoryStore) Remember(text string, importance float64, category string
 }
 
 // Recall performs semantic similarity search on memories.
-func (ms *MemoryStore) Recall(query string, maxResults int) ([]MemoryRecallResult, error) {
+func (ms *MemoryStore) Recall(query string, maxResults int) ([]agent.MemoryRecallResult, error) {
 	if ms.embedding == nil {
 		return nil, fmt.Errorf("embedding service not available")
 	}
@@ -312,11 +312,11 @@ func (ms *MemoryStore) Recall(query string, maxResults int) ([]MemoryRecallResul
 	}
 	defer rows.Close()
 
-	var results []MemoryRecallResult
+	var results []agent.MemoryRecallResult
 	var memoryIDs []string
 
 	for rows.Next() {
-		var r MemoryRecallResult
+		var r agent.MemoryRecallResult
 		var content sql.NullString
 		var category sql.NullString
 		var distance float64

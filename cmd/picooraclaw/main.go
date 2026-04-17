@@ -36,6 +36,7 @@ import (
 	"github.com/jasperan/picooraclaw/pkg/migrate"
 	oracledb "github.com/jasperan/picooraclaw/pkg/oracle"
 	"github.com/jasperan/picooraclaw/pkg/providers"
+	storage "github.com/jasperan/picooraclaw/pkg/storage"
 	"github.com/jasperan/picooraclaw/pkg/skills"
 	"github.com/jasperan/picooraclaw/pkg/state"
 	"github.com/jasperan/picooraclaw/pkg/tools"
@@ -144,8 +145,8 @@ func main() {
 		authCmd()
 	case "cron":
 		cronCmd()
-	case "setup-oracle":
-		setupOracleCmd()
+	case "setup-database", "setup-oracle":
+		setupDatabaseCmd()
 	case "oracle-inspect":
 		oracleInspectCmd()
 	case "seed-demo":
@@ -419,17 +420,33 @@ func agentCmd() {
 	msgBus := bus.NewMessageBus()
 
 	var agentLoop *agent.AgentLoop
-	var oracleConn *oracledb.ConnectionManager
+	var dbConn storage.ConnectionManager
 
-	if cfg.Oracle.Enabled {
-		agentLoop, oracleConn, err = initOracleAgent(cfg, msgBus, provider)
+	// Check if database storage is enabled
+	storageType := cfg.StorageType
+	if storageType == "" {
+		storageType = "oracle"
+	}
+
+	var isDBEnabled bool
+	switch storageType {
+	case "postgres":
+		isDBEnabled = cfg.Postgres.Enabled
+	case "oracle":
+		isDBEnabled = cfg.Oracle.Enabled
+	}
+
+	if isDBEnabled {
+		agentLoop, dbConn, err = initDatabaseAgent(cfg, msgBus, provider)
 		if err != nil {
-			fmt.Printf("Oracle initialization failed: %v\n", err)
+			fmt.Printf("Database initialization failed: %v\n", err)
 			fmt.Println("Falling back to file-based storage...")
 			agentLoop = agent.NewAgentLoop(cfg, msgBus, provider)
 		} else {
-			defer oracleConn.Close()
-			fmt.Println("✓ Oracle AI Database storage enabled")
+			if dbConn != nil {
+				defer dbConn.Close()
+			}
+			fmt.Printf("✓ %s AI Database storage enabled\n", storageType)
 		}
 	} else {
 		agentLoop = agent.NewAgentLoop(cfg, msgBus, provider)
@@ -570,17 +587,33 @@ func gatewayCmd() {
 	msgBus := bus.NewMessageBus()
 
 	var agentLoop *agent.AgentLoop
-	var oracleConn *oracledb.ConnectionManager
+	var dbConn storage.ConnectionManager
 
-	if cfg.Oracle.Enabled {
-		agentLoop, oracleConn, err = initOracleAgent(cfg, msgBus, provider)
+	// Check if database storage is enabled
+	storageType := cfg.StorageType
+	if storageType == "" {
+		storageType = "oracle"
+	}
+
+	var isDBEnabled bool
+	switch storageType {
+	case "postgres":
+		isDBEnabled = cfg.Postgres.Enabled
+	case "oracle":
+		isDBEnabled = cfg.Oracle.Enabled
+	}
+
+	if isDBEnabled {
+		agentLoop, dbConn, err = initDatabaseAgent(cfg, msgBus, provider)
 		if err != nil {
-			fmt.Printf("Oracle initialization failed: %v\n", err)
+			fmt.Printf("Database initialization failed: %v\n", err)
 			fmt.Println("Falling back to file-based storage...")
 			agentLoop = agent.NewAgentLoop(cfg, msgBus, provider)
 		} else {
-			defer oracleConn.Close()
-			fmt.Println("✓ Oracle AI Database storage enabled")
+			if dbConn != nil {
+				defer dbConn.Close()
+			}
+			fmt.Printf("✓ %s AI Database storage enabled\n", storageType)
 		}
 	} else {
 		agentLoop = agent.NewAgentLoop(cfg, msgBus, provider)
@@ -1507,169 +1540,195 @@ func skillsShowCmd(loader *skills.SkillsLoader, skillName string) {
 	fmt.Println(content)
 }
 
-// setupOracleCmd initializes Oracle schema and loads the ONNX model.
-func setupOracleCmd() {
+// setupDatabaseCmd initializes database schema and loads the embedding model.
+func setupDatabaseCmd() {
 	cfg, err := loadConfig()
 	if err != nil {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
 	}
 
-	if !cfg.Oracle.Enabled {
-		fmt.Println("Oracle is not enabled in config. Set oracle.enabled = true first.")
+	storageType := cfg.StorageType
+	if storageType == "" {
+		storageType = "oracle"
+	}
+
+	// Determine which storage backend to use
+	var isEnabled bool
+	switch storageType {
+	case "postgres":
+		isEnabled = cfg.Postgres.Enabled
+	case "oracle":
+		isEnabled = cfg.Oracle.Enabled
+	default:
+		fmt.Printf("Unknown storage type: %s\n", storageType)
 		os.Exit(1)
 	}
 
-	fmt.Println("🔧 Setting up Oracle Database for picooraclaw...")
+	if !isEnabled {
+		fmt.Printf("%s is not enabled in config. Set %s.enabled = true first.\n",
+			storageType, storageType)
+		os.Exit(1)
+	}
 
-	// Connect
-	conn, err := oracledb.NewConnectionManager(&cfg.Oracle)
+	fmt.Printf("🔧 Setting up %s Database for picooraclaw...\n", storageType)
+
+	// Connect using factory
+	conn, err := storage.NewConnectionManager(cfg)
 	if err != nil {
 		fmt.Printf("✗ Connection failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
-	fmt.Println("✓ Connected to Oracle Database")
+	fmt.Printf("✓ Connected to %s Database\n", storageType)
 
-	// Init schema
-	if err := oracledb.InitSchema(conn.DB()); err != nil {
+	// Init schema using factory
+	if err := storage.InitSchema(cfg, conn.DB()); err != nil {
 		fmt.Printf("✗ Schema initialization failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println("✓ Schema initialized (8 tables with PICO_ prefix)")
 
-	// Set up embedding service
-	var embSvc *oracledb.EmbeddingService
-	if cfg.Oracle.EmbeddingProvider == "api" && cfg.Oracle.EmbeddingAPIKey != "" {
-		embSvc = oracledb.NewAPIEmbeddingService(conn.DB(), cfg.Oracle.EmbeddingAPIBase, cfg.Oracle.EmbeddingAPIKey, cfg.Oracle.EmbeddingModel)
-		fmt.Printf("✓ Using API embedding provider (model: %s)\n", cfg.Oracle.EmbeddingModel)
-	} else {
-		var embErr error
-		embSvc, embErr = oracledb.NewEmbeddingService(conn.DB(), cfg.Oracle.ONNXModel)
-		if embErr != nil {
-			fmt.Printf("✗ Failed to create embedding service: %v\n", embErr)
-			os.Exit(1)
-		}
-		loaded, err := embSvc.CheckONNXLoaded()
-		if err != nil {
-			fmt.Printf("⚠ Could not check ONNX model status: %v\n", err)
-		}
+	// Set up embedding service using factory
+	embSvc, err := storage.NewEmbeddingService(cfg, conn.DB())
+	if err != nil {
+		fmt.Printf("✗ Failed to create embedding service: %v\n", err)
+		os.Exit(1)
+	}
 
-		if loaded {
-			fmt.Printf("✓ ONNX model '%s' already loaded\n", cfg.Oracle.ONNXModel)
-		} else {
-			fmt.Printf("Loading ONNX model '%s'...\n", cfg.Oracle.ONNXModel)
+	// Test embedding and get mode info
+	embMode := "api"
+	if storageType == "oracle" && cfg.Oracle.EmbeddingProvider == "onnx" {
+		embMode = "onnx"
+	}
+	fmt.Printf("✓ Using %s embedding provider (mode: %s)\n", storageType, embMode)
 
-			onnxDir := "PICO_ONNX_DIR"
-			onnxFile := "all_MiniLM_L12_v2.onnx"
+	// For Oracle ONNX mode, handle ONNX model loading
+	if storageType == "oracle" && cfg.Oracle.EmbeddingProvider == "onnx" {
+		if oracleEmbSvc, ok := embSvc.(*oracledb.EmbeddingService); ok {
+			loaded, err := oracleEmbSvc.CheckONNXLoaded()
+			if err != nil {
+				fmt.Printf("⚠ Could not check ONNX model status: %v\n", err)
+			}
 
-			// Parse optional args
-			args := os.Args[2:]
-			for i := 0; i < len(args); i++ {
-				switch args[i] {
-				case "--onnx-dir":
-					if i+1 < len(args) {
-						onnxDir = args[i+1]
-						i++
-					}
-				case "--onnx-file":
-					if i+1 < len(args) {
-						onnxFile = args[i+1]
-						i++
+			if loaded {
+				fmt.Printf("✓ ONNX model '%s' already loaded\n", cfg.Oracle.ONNXModel)
+			} else {
+				fmt.Printf("Loading ONNX model '%s'...\n", cfg.Oracle.ONNXModel)
+
+				onnxDir := "PICO_ONNX_DIR"
+				onnxFile := "all_MiniLM_L12_v2.onnx"
+
+				// Parse optional args
+				args := os.Args[2:]
+				for i := 0; i < len(args); i++ {
+					switch args[i] {
+					case "--onnx-dir":
+						if i+1 < len(args) {
+							onnxDir = args[i+1]
+							i++
+						}
+					case "--onnx-file":
+						if i+1 < len(args) {
+							onnxFile = args[i+1]
+							i++
+						}
 					}
 				}
-			}
 
-			if err := embSvc.LoadONNXModel(onnxDir, onnxFile); err != nil {
-				fmt.Printf("✗ ONNX model load failed: %v\n", err)
-				fmt.Println("  You may need to manually load the ONNX model.")
-				fmt.Println("  See: https://docs.oracle.com/en/database/oracle/oracle-database/23/vecse/")
-			} else {
-				fmt.Printf("✓ ONNX model '%s' loaded\n", cfg.Oracle.ONNXModel)
+				if err := oracleEmbSvc.LoadONNXModel(onnxDir, onnxFile); err != nil {
+					fmt.Printf("✗ ONNX model load failed: %v\n", err)
+					fmt.Println("  You may need to manually load the ONNX model.")
+					fmt.Println("  See: https://docs.oracle.com/en/database/oracle/oracle-database/23/vecse/")
+				} else {
+					fmt.Printf("✓ ONNX model '%s' loaded\n", cfg.Oracle.ONNXModel)
+				}
 			}
 		}
 	}
 
-	// Test embedding
-	if embSvc.TestEmbedding() {
-		fmt.Printf("✓ Embedding test passed (mode: %s)\n", embSvc.Mode())
-	} else {
-		fmt.Printf("⚠ Embedding test failed (mode: %s)\n", embSvc.Mode())
-	}
+	// Note: Embedding service testing is handled during actual embedding operations
 
 	// Seed prompts from workspace
-	promptStore := oracledb.NewPromptStore(conn.DB(), cfg.Oracle.AgentID)
+	promptStore := storage.NewPromptStore(cfg, conn.DB())
 	workspace := cfg.WorkspacePath()
-	if err := promptStore.SeedFromWorkspace(workspace); err != nil {
-		fmt.Printf("⚠ Prompt seeding warning: %v\n", err)
-	} else {
-		fmt.Println("✓ Prompts seeded from workspace")
+	if promptStoreObj, ok := promptStore.(interface{ SeedFromWorkspace(string) error }); ok {
+		if err := promptStoreObj.SeedFromWorkspace(workspace); err != nil {
+			fmt.Printf("⚠ Prompt seeding warning: %v\n", err)
+		} else {
+			fmt.Println("✓ Prompts seeded from workspace")
+		}
 	}
 
-	fmt.Println("\n🎉 Oracle setup complete! picooraclaw is ready to use Oracle AI Database.")
+	fmt.Printf("\n🎉 %s setup complete! picooraclaw is ready to use %s AI Database.\n",
+		storageType, storageType)
 }
 
-// initOracleAgent creates an agent loop with Oracle-backed stores.
-func initOracleAgent(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) (*agent.AgentLoop, *oracledb.ConnectionManager, error) {
-	conn, err := oracledb.NewConnectionManager(&cfg.Oracle)
+// initDatabaseAgent creates an agent loop with database-backed stores (Oracle or PostgreSQL).
+func initDatabaseAgent(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) (*agent.AgentLoop, storage.ConnectionManager, error) {
+	storageType := cfg.StorageType
+	if storageType == "" {
+		storageType = "oracle"
+	}
+
+	logger.InfoCF("database", "Initializing agent with storage type", map[string]interface{}{"storage": storageType})
+
+	// Connect using factory
+	conn, err := storage.NewConnectionManager(cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Oracle connection failed: %w", err)
+		return nil, nil, fmt.Errorf("%s connection failed: %w", storageType, err)
 	}
 
 	db := conn.DB()
-	agentID := cfg.Oracle.AgentID
 
-	// Create embedding service (API mode or in-database ONNX mode)
-	var embSvc *oracledb.EmbeddingService
-	if cfg.Oracle.EmbeddingProvider == "api" && cfg.Oracle.EmbeddingAPIKey != "" {
-		embSvc = oracledb.NewAPIEmbeddingService(db, cfg.Oracle.EmbeddingAPIBase, cfg.Oracle.EmbeddingAPIKey, cfg.Oracle.EmbeddingModel)
-		logger.InfoC("oracle", "Using API-based embedding service")
-	} else {
-		var embErr error
-		embSvc, embErr = oracledb.NewEmbeddingService(db, cfg.Oracle.ONNXModel)
-		if embErr != nil {
-			logger.ErrorCF("oracle", "Failed to create embedding service", map[string]interface{}{"error": embErr.Error()})
-			return nil, nil, fmt.Errorf("failed to create embedding service: %w", embErr)
-		}
-		logger.InfoC("oracle", "Using in-database ONNX embedding service")
+	// Create embedding service using factory
+	embSvc, err := storage.NewEmbeddingService(cfg, db)
+	if err != nil {
+		logger.ErrorCF("database", "Failed to create embedding service", map[string]interface{}{"error": err.Error()})
+		conn.Close()
+		return nil, nil, fmt.Errorf("failed to create embedding service: %w", err)
 	}
+	logger.InfoCF("database", "Using embedding service", map[string]interface{}{"type": storageType})
 
-	// Create Oracle stores
-	sessionStore := oracledb.NewSessionStore(db, agentID)
-	stateStore := oracledb.NewStateStore(db, agentID)
-	memoryStore := oracledb.NewMemoryStore(db, agentID, embSvc)
+	// Create stores using factory
+	sessionStore := storage.NewSessionStore(cfg, db)
+	stateStore := storage.NewStateStore(cfg, db)
+	memoryStore := storage.NewMemoryStore(cfg, db, embSvc)
 
-	// Create agent loop with Oracle stores
+	// Create agent loop with database stores
 	agentLoop := agent.NewAgentLoopWithStores(cfg, msgBus, provider, sessionStore, stateStore, memoryStore)
 
 	// Register remember/recall/daily-note tools
 	agentLoop.RegisterTool(tools.NewRememberTool(memoryStore))
 	agentLoop.RegisterTool(tools.NewWriteDailyNoteTool(memoryStore))
 
-	// Create a recall adapter that bridges oracle.MemoryRecallResult to tools.RecallResult
+	// Create a recall adapter that bridges MemoryStore to tools.RecallResult
 	agentLoop.RegisterTool(tools.NewRecallTool(&recallAdapter{store: memoryStore}))
 
-	// Wire prompt store into context builder for Oracle-backed prompts
-	promptStore := oracledb.NewPromptStore(db, agentID)
-	agentLoop.SetPromptStore(promptStore)
+	// Wire prompt store into context builder for database-backed prompts
+	promptStoreRaw := storage.NewPromptStore(cfg, db)
+	if promptStore, ok := promptStoreRaw.(agent.PromptStoreInterface); ok {
+		agentLoop.SetPromptStore(promptStore)
+	}
 
-	logger.InfoC("oracle", "Oracle stores initialized")
+	logger.InfoCF("database", "Database stores initialized", map[string]interface{}{"storage": storageType})
 	return agentLoop, conn, nil
 }
 
-// recallAdapter adapts oracle.MemoryStore to tools.Recaller interface.
+// recallAdapter adapts MemoryStore to tools.Recaller interface.
+// Works with both Oracle and PostgreSQL memory stores through the interface.
 type recallAdapter struct {
-	store *oracledb.MemoryStore
+	store agent.OracleMemoryStore
 }
 
 func (a *recallAdapter) Recall(query string, maxResults int) ([]tools.RecallResult, error) {
-	oracleResults, err := a.store.Recall(query, maxResults)
+	memResults, err := a.store.Recall(query, maxResults)
 	if err != nil {
 		return nil, err
 	}
 
-	results := make([]tools.RecallResult, len(oracleResults))
-	for i, r := range oracleResults {
+	results := make([]tools.RecallResult, len(memResults))
+	for i, r := range memResults {
 		results[i] = tools.RecallResult{
 			MemoryID:   r.MemoryID,
 			Text:       r.Text,

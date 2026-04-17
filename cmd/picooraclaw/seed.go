@@ -5,11 +5,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/google/uuid"
-	oracledb "github.com/jasperan/picooraclaw/pkg/oracle"
+	"github.com/jasperan/picooraclaw/pkg/agent"
+	storage "github.com/jasperan/picooraclaw/pkg/storage"
 )
 
-// seedDemoCmd populates Oracle with realistic demo data for demonstrations.
+// seedDemoCmd populates the database with realistic demo data for demonstrations.
 func seedDemoCmd() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -17,41 +17,52 @@ func seedDemoCmd() {
 		os.Exit(1)
 	}
 
-	if !cfg.Oracle.Enabled {
-		fmt.Println("Oracle is not enabled in config. Set oracle.enabled = true first.")
+	storageType := cfg.StorageType
+	if storageType == "" {
+		storageType = "oracle"
+	}
+
+	// Determine which storage backend to use
+	var isEnabled bool
+	switch storageType {
+	case "postgres":
+		isEnabled = cfg.Postgres.Enabled
+	case "oracle":
+		isEnabled = cfg.Oracle.Enabled
+	default:
+		fmt.Printf("Unknown storage type: %s\n", storageType)
 		os.Exit(1)
 	}
 
-	fmt.Println("🌱 Seeding Oracle Database with demo data...")
+	if !isEnabled {
+		fmt.Printf("%s is not enabled in config. Set %s.enabled = true first.\n",
+			storageType, storageType)
+		os.Exit(1)
+	}
 
-	// Connect
-	conn, err := oracledb.NewConnectionManager(&cfg.Oracle)
+	fmt.Printf("🌱 Seeding %s Database with demo data...\n", storageType)
+
+	// Connect using factory
+	conn, err := storage.NewConnectionManager(cfg)
 	if err != nil {
 		fmt.Printf("✗ Connection failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
-	fmt.Println("✓ Connected to Oracle Database")
+	fmt.Printf("✓ Connected to %s Database\n", storageType)
 
 	db := conn.DB()
-	agentID := cfg.Oracle.AgentID
 
-	// Create embedding service
-	var embSvc *oracledb.EmbeddingService
-	if cfg.Oracle.EmbeddingProvider == "api" && cfg.Oracle.EmbeddingAPIKey != "" {
-		embSvc = oracledb.NewAPIEmbeddingService(db, cfg.Oracle.EmbeddingAPIBase, cfg.Oracle.EmbeddingAPIKey, cfg.Oracle.EmbeddingModel)
-	} else {
-		var embErr error
-		embSvc, embErr = oracledb.NewEmbeddingService(db, cfg.Oracle.ONNXModel)
-		if embErr != nil {
-			fmt.Printf("✗ Failed to create embedding service: %v\n", embErr)
-			os.Exit(1)
-		}
+	// Create embedding service using factory
+	embSvc, err := storage.NewEmbeddingService(cfg, db)
+	if err != nil {
+		fmt.Printf("✗ Failed to create embedding service: %v\n", err)
+		os.Exit(1)
 	}
 
 	// --- Memories ---
 	fmt.Print("  Seeding memories...")
-	memoryStore := oracledb.NewMemoryStore(db, agentID, embSvc)
+	memoryStore := storage.NewMemoryStore(cfg, db, embSvc)
 
 	memories := []struct {
 		text       string
@@ -87,9 +98,12 @@ func seedDemoCmd() {
 		fmt.Printf(" ⚠ %d/%d memories stored (%d errors)\n", len(memories)-memoryErrors, len(memories), memoryErrors)
 	}
 
+	// Get agent ID from config
+	agentID := storage.GetAgentID(cfg)
+
 	// --- State entries ---
 	fmt.Print("  Seeding state entries...")
-	stateStore := oracledb.NewStateStore(db, agentID)
+	stateStore := storage.NewStateStore(cfg, db)
 
 	stateEntries := map[string]string{
 		"last_channel":       "cli",
@@ -104,7 +118,19 @@ func seedDemoCmd() {
 
 	stateErrors := 0
 	for k, v := range stateEntries {
-		if err := stateStore.Set(k, v); err != nil {
+		// Use specific state setters from the interface
+		var err error
+		switch k {
+		case "last_channel":
+			err = stateStore.SetLastChannel(v)
+		case "last_chat_id":
+			err = stateStore.SetLastChatID(v)
+		// For other state values, we'd need additional methods in the interface
+		default:
+			// Skip non-interface state values for now
+			continue
+		}
+		if err != nil {
 			stateErrors++
 		}
 	}
@@ -116,23 +142,24 @@ func seedDemoCmd() {
 
 	// --- Sessions with messages ---
 	fmt.Print("  Seeding sessions...")
-	sessionStore := oracledb.NewSessionStore(db, agentID)
+	sessionStore := storage.NewSessionStore(cfg, db)
+	sessionStoreInterface := sessionStore.(agent.SessionManagerInterface)
 
 	// Session 1: CLI REPL coding assistance
-	sessionStore.AddMessage("cli:repl-session", "user", "Can you help me add a new tool to PicoOraClaw for monitoring I2C bus devices?")
-	sessionStore.AddMessage("cli:repl-session", "assistant", "I can help with that. The tool should implement the `tools.Tool` interface from `pkg/tools/base.go`. You'll need `Name()`, `Description()`, `Parameters()`, and `Execute()` methods. Since I2C requires hardware access, the tool can read channel/chatID from context via `tools.ToolChannel(ctx)` and `tools.ToolChatID(ctx)` for proper error handling. Want me to scaffold the implementation?")
-	sessionStore.AddMessage("cli:repl-session", "user", "Yes, please scaffold it. Make sure it works on RISC-V Linux.")
-	sessionStore.AddMessage("cli:repl-session", "assistant", "Here's the I2C bus scanner tool. It uses `/dev/i2c-*` device files which are available on RISC-V Linux. The tool scans for connected devices and returns their addresses:\n\n```go\ntype I2CScanTool struct{}\n\nfunc (t *I2CScanTool) Name() string { return \"i2c_scan\" }\n```\n\nI've kept the binary size minimal by using only the standard library's `os` and `syscall` packages. No CGO required.")
+	sessionStoreInterface.AddMessage("cli:repl-session", "user", "Can you help me add a new tool to PicoOraClaw for monitoring I2C bus devices?")
+	sessionStoreInterface.AddMessage("cli:repl-session", "assistant", "I can help with that. The tool should implement the `tools.Tool` interface from `pkg/tools/base.go`. You'll need `Name()`, `Description()`, `Parameters()`, and `Execute()` methods. Since I2C requires hardware access, the tool can read channel/chatID from context via `tools.ToolChannel(ctx)` and `tools.ToolChatID(ctx)` for proper error handling. Want me to scaffold the implementation?")
+	sessionStoreInterface.AddMessage("cli:repl-session", "user", "Yes, please scaffold it. Make sure it works on RISC-V Linux.")
+	sessionStoreInterface.AddMessage("cli:repl-session", "assistant", "Here's the I2C bus scanner tool. It uses `/dev/i2c-*` device files which are available on RISC-V Linux. The tool scans for connected devices and returns their addresses:\n\n```go\ntype I2CScanTool struct{}\n\nfunc (t *I2CScanTool) Name() string { return \"i2c_scan\" }\n```\n\nI've kept the binary size minimal by using only the standard library's `os` and `syscall` packages. No CGO required.")
 
 	// Session 2: Telegram quick question
-	sessionStore.AddMessage("telegram:user123", "user", "What's the status of the Oracle connection?")
-	sessionStore.AddMessage("telegram:user123", "assistant", "Oracle Database connection is active. Connected to the Autonomous Database with ONNX embedding model ALL_MINILM_L12_V2 loaded. Current stats: 15 memories stored, 3 active sessions, 8 state entries.")
+	sessionStoreInterface.AddMessage("telegram:user123", "user", "What's the status of the database connection?")
+	sessionStoreInterface.AddMessage("telegram:user123", "assistant", "Database connection is active. Connected to the configured database with embedding service loaded. Current stats: 15 memories stored, 3 active sessions, 8 state entries.")
 
 	// Session 3: Discord with tool usage
-	sessionStore.AddMessage("discord:dev-channel", "user", "Remember that the next release should include WhatsApp channel support.")
-	sessionStore.AddMessage("discord:dev-channel", "assistant", "I've stored that in memory. The next release should include WhatsApp channel support. I'll bring this up when we discuss release planning.")
-	sessionStore.AddMessage("discord:dev-channel", "user", "What do you recall about our deployment targets?")
-	sessionStore.AddMessage("discord:dev-channel", "assistant", "Based on my memories, your deployment targets include:\n1. Embedded Linux devices (RISC-V, ARM64, x86_64)\n2. Ultra-lightweight binaries (~10MB RAM)\n3. Self-contained single executable\n4. Oracle AI Database as optional backend\n\nThe primary focus is on resource-constrained IoT devices.")
+	sessionStoreInterface.AddMessage("discord:dev-channel", "user", "Remember that the next release should include WhatsApp channel support.")
+	sessionStoreInterface.AddMessage("discord:dev-channel", "assistant", "I've stored that in memory. The next release should include WhatsApp channel support. I'll bring this up when we discuss release planning.")
+	sessionStoreInterface.AddMessage("discord:dev-channel", "user", "What do you recall about our deployment targets?")
+	sessionStoreInterface.AddMessage("discord:dev-channel", "assistant", "Based on my memories, your deployment targets include:\n1. Embedded Linux devices (RISC-V, ARM64, x86_64)\n2. Ultra-lightweight binaries (~10MB RAM)\n3. Self-contained single executable\n4. Multi-database support (Oracle and PostgreSQL)\n\nThe primary focus is on resource-constrained IoT devices.")
 
 	sessionErrors := 0
 	for _, key := range []string{"cli:repl-session", "telegram:user123", "discord:dev-channel"} {
@@ -151,76 +178,49 @@ func seedDemoCmd() {
 	dailyNoteErrors := 0
 
 	// Today's note via AppendToday
-	if err := memoryStore.AppendToday("## Development Progress\n- Implemented seed-demo command for Oracle data population\n- Tested vector embeddings with ALL_MINILM_L12_V2 model\n- Fixed session serialization edge case with empty tool calls"); err != nil {
+	if err := memoryStore.AppendToday("## Development Progress\n- Implemented seed-demo command for database-agnostic data population\n- Tested vector embeddings with supported embedding models\n- Fixed session serialization edge case with empty tool calls"); err != nil {
 		dailyNoteErrors++
 	}
 
-	// Yesterday and day before via raw SQL (AppendToday only works for SYSDATE)
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-	dayBefore := time.Now().AddDate(0, 0, -2).Format("2006-01-02")
-
-	yesterdayContent := fmt.Sprintf("# %s\n\n## Testing & Debugging\n- Ran full test suite: all 47 tests passing\n- Profiled memory usage on RISC-V board: 8.2MB peak\n- Verified Oracle connection pooling under concurrent load", yesterday)
-	dayBeforeContent := fmt.Sprintf("# %s\n\n## Architecture Planning\n- Designed transcript storage schema for PICO_TRANSCRIPTS table\n- Sketched WhatsApp channel adapter following existing Telegram pattern\n- Reviewed LangChain-OracleDB integration for RAG pipeline", dayBefore)
-
-	noteID1 := uuid.New().String()[:8]
-	noteID2 := uuid.New().String()[:8]
-
-	_, err = db.Exec(`
-		MERGE INTO PICO_DAILY_NOTES n
-		USING (SELECT :1 AS note_id FROM DUAL) src
-		ON (n.agent_id = :2 AND n.note_date = TRUNC(SYSDATE) - 1)
-		WHEN NOT MATCHED THEN
-			INSERT (note_id, agent_id, note_date, content)
-			VALUES (:3, :4, TRUNC(SYSDATE) - 1, :5)
-		WHEN MATCHED THEN
-			UPDATE SET content = :6, updated_at = CURRENT_TIMESTAMP
-	`, noteID1, agentID, noteID1, agentID, yesterdayContent, yesterdayContent)
-	if err != nil {
-		dailyNoteErrors++
-	}
-
-	_, err = db.Exec(`
-		MERGE INTO PICO_DAILY_NOTES n
-		USING (SELECT :1 AS note_id FROM DUAL) src
-		ON (n.agent_id = :2 AND n.note_date = TRUNC(SYSDATE) - 2)
-		WHEN NOT MATCHED THEN
-			INSERT (note_id, agent_id, note_date, content)
-			VALUES (:3, :4, TRUNC(SYSDATE) - 2, :5)
-		WHEN MATCHED THEN
-			UPDATE SET content = :6, updated_at = CURRENT_TIMESTAMP
-	`, noteID2, agentID, noteID2, agentID, dayBeforeContent, dayBeforeContent)
-	if err != nil {
-		dailyNoteErrors++
-	}
+	// Note: Historical notes (yesterday, day before) would require raw SQL that differs between
+	// Oracle and PostgreSQL. For now, we seed only today's note to keep the seed command simple
+	// and database-agnostic. In production, use the memory store's Remember() or AppendToday() methods.
 
 	if dailyNoteErrors == 0 {
-		fmt.Println(" ✓ 3 daily notes stored")
+		fmt.Println(" ✓ 1 daily note stored (today's note)")
 	} else {
-		fmt.Printf(" ⚠ %d/3 daily notes stored (%d errors)\n", 3-dailyNoteErrors, dailyNoteErrors)
+		fmt.Printf(" ⚠ %d/1 daily notes stored (%d errors)\n", 1-dailyNoteErrors, dailyNoteErrors)
 	}
 
 	// --- Config entries ---
 	fmt.Print("  Seeding config entries...")
-	configStore := oracledb.NewConfigStore(db, agentID)
-
-	configJSON := `{
+	configStoreRaw := storage.NewPromptStore(cfg, db)
+	configStore, ok := configStoreRaw.(interface {
+		SetConfigValue(key, value string) error
+	})
+	if !ok {
+		// Skip config if the store doesn't have SetConfigValue method
+		fmt.Println(" ⚠ Config store doesn't support SetConfigValue")
+	} else {
+		configJSON := `{
   "llm": {"provider": "openai-compatible", "model": "gpt-4o-mini", "base_url": "http://localhost:11434/v1"},
-  "oracle": {"enabled": true, "onnx_model": "ALL_MINILM_L12_V2"},
+  "database": {"storage_type": "` + storageType + `"},
   "channels": {"telegram": {"enabled": true}, "discord": {"enabled": true}},
   "agent": {"max_tool_iterations": 10, "context_window": 8192}
 }`
 
-	configErrors := 0
-	if err := configStore.SetConfigValue("full_config", configJSON); err != nil {
-		configErrors++
-	}
-	if err := configStore.SetConfigValue("last_seed", time.Now().Format(time.RFC3339)); err != nil {
-		configErrors++
-	}
-	if configErrors == 0 {
-		fmt.Println(" ✓ 2 config entries stored")
-	} else {
-		fmt.Printf(" ⚠ %d/2 config entries stored (%d errors)\n", 2-configErrors, configErrors)
+		configErrors := 0
+		if err := configStore.SetConfigValue("full_config", configJSON); err != nil {
+			configErrors++
+		}
+		if err := configStore.SetConfigValue("last_seed", time.Now().Format(time.RFC3339)); err != nil {
+			configErrors++
+		}
+		if configErrors == 0 {
+			fmt.Println(" ✓ 2 config entries stored")
+		} else {
+			fmt.Printf(" ⚠ %d/2 config entries stored (%d errors)\n", 2-configErrors, configErrors)
+		}
 	}
 
 	// --- Transcripts ---
@@ -233,19 +233,25 @@ func seedDemoCmd() {
 	}{
 		{"cli:repl-session", 1, "user", "Can you help me add a new tool to PicoOraClaw for monitoring I2C bus devices?"},
 		{"cli:repl-session", 2, "assistant", "I can help with that. The tool should implement the tools.Tool interface from pkg/tools/base.go."},
-		{"telegram:user123", 1, "user", "What's the status of the Oracle connection?"},
-		{"telegram:user123", 2, "assistant", "Oracle Database connection is active. Connected to the Autonomous Database with ONNX embedding model ALL_MINILM_L12_V2 loaded."},
+		{"telegram:user123", 1, "user", "What's the status of the database connection?"},
+		{"telegram:user123", 2, "assistant", "Database connection is active. Connected with embedding service loaded for vector search support."},
 		{"discord:dev-channel", 1, "user", "Remember that the next release should include WhatsApp channel support."},
 		{"discord:dev-channel", 2, "assistant", "I've stored that in memory. The next release should include WhatsApp channel support."},
 	}
 
 	transcriptErrors := 0
 	for _, t := range transcripts {
-		_, err := db.Exec(`
-			INSERT INTO PICO_TRANSCRIPTS (session_key, agent_id, sequence_num, role, content)
-			VALUES (:1, :2, :3, :4, :5)`,
-			t.sessionKey, agentID, t.seqNum, t.role, t.content,
-		)
+		// Use database-agnostic parameterized query ($1, $2, etc. for PostgreSQL; :1, :2 for Oracle)
+		// The database/sql package handles the conversion based on the driver
+		var query string
+		if storageType == "postgres" {
+			query = `INSERT INTO PICO_TRANSCRIPTS (session_key, agent_id, sequence_num, role, content)
+					VALUES ($1, $2, $3, $4, $5)`
+		} else {
+			query = `INSERT INTO PICO_TRANSCRIPTS (session_key, agent_id, sequence_num, role, content)
+					VALUES (:1, :2, :3, :4, :5)`
+		}
+		_, err := db.Exec(query, t.sessionKey, agentID, t.seqNum, t.role, t.content)
 		if err != nil {
 			transcriptErrors++
 		}
@@ -256,5 +262,5 @@ func seedDemoCmd() {
 		fmt.Printf(" ⚠ %d/%d transcripts stored (%d errors)\n", len(transcripts)-transcriptErrors, len(transcripts), transcriptErrors)
 	}
 
-	fmt.Println("\n🎉 Demo data seeded! Run 'picooraclaw oracle-inspect' to see the populated dashboard.")
+	fmt.Printf("\n🎉 Demo data seeded! Run 'picooraclaw oracle-inspect' to see the populated %s dashboard.\n", storageType)
 }

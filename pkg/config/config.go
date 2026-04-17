@@ -44,15 +44,17 @@ func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
-	Agents    AgentsConfig    `json:"agents"`
-	Channels  ChannelsConfig  `json:"channels"`
-	Providers ProvidersConfig `json:"providers"`
-	Gateway   GatewayConfig   `json:"gateway"`
-	Tools     ToolsConfig     `json:"tools"`
-	Heartbeat HeartbeatConfig `json:"heartbeat"`
-	Devices   DevicesConfig   `json:"devices"`
-	Oracle    OracleDBConfig  `json:"oracle"`
-	mu        sync.RWMutex
+	Agents      AgentsConfig      `json:"agents"`
+	Channels    ChannelsConfig    `json:"channels"`
+	Providers   ProvidersConfig   `json:"providers"`
+	Gateway     GatewayConfig     `json:"gateway"`
+	Tools       ToolsConfig       `json:"tools"`
+	Heartbeat   HeartbeatConfig   `json:"heartbeat"`
+	Devices     DevicesConfig     `json:"devices"`
+	StorageType string            `json:"storage_type" env:"PICO_STORAGE_TYPE"` // "oracle" or "postgres", defaults to "oracle"
+	Oracle      OracleDBConfig    `json:"oracle"`
+	Postgres    PostgresDBConfig  `json:"postgres"`
+	mu          sync.RWMutex
 }
 
 type AgentsConfig struct {
@@ -196,6 +198,23 @@ type OracleDBConfig struct {
 	EmbeddingModel    string `json:"embedding_model" env:"PICO_ORACLE_EMBEDDING_MODEL"`
 }
 
+type PostgresDBConfig struct {
+	Enabled           bool   `json:"enabled" env:"PICO_POSTGRES_ENABLED"`
+	Host              string `json:"host" env:"PICO_POSTGRES_HOST"`
+	Port              int    `json:"port" env:"PICO_POSTGRES_PORT"`
+	Database          string `json:"database" env:"PICO_POSTGRES_DATABASE"`
+	User              string `json:"user" env:"PICO_POSTGRES_USER"`
+	Password          string `json:"password" env:"PICO_POSTGRES_PASSWORD"`
+	SSLMode           string `json:"ssl_mode" env:"PICO_POSTGRES_SSL_MODE"` // "disable", "require", "verify-full"
+	PoolMaxOpen       int    `json:"pool_max_open" env:"PICO_POSTGRES_POOL_MAX_OPEN"`
+	PoolMaxIdle       int    `json:"pool_max_idle" env:"PICO_POSTGRES_POOL_MAX_IDLE"`
+	AgentID           string `json:"agent_id" env:"PICO_POSTGRES_AGENT_ID"`
+	EmbeddingProvider string `json:"embedding_provider" env:"PICO_POSTGRES_EMBEDDING_PROVIDER"` // "api" or "local"
+	EmbeddingAPIBase  string `json:"embedding_api_base" env:"PICO_POSTGRES_EMBEDDING_API_BASE"`
+	EmbeddingAPIKey   string `json:"embedding_api_key" env:"PICO_POSTGRES_EMBEDDING_API_KEY"`
+	EmbeddingModel    string `json:"embedding_model" env:"PICO_POSTGRES_EMBEDDING_MODEL"`
+}
+
 func (o *OracleDBConfig) IsADB() bool {
 	return o.Mode == "adb"
 }
@@ -269,6 +288,7 @@ type ToolsConfig struct {
 
 func DefaultConfig() *Config {
 	return &Config{
+		StorageType: "oracle", // Default to oracle for backward compatibility
 		Agents: AgentsConfig{
 			Defaults: AgentDefaults{
 				Workspace:           "~/.picooraclaw/workspace",
@@ -404,6 +424,22 @@ func DefaultConfig() *Config {
 			PoolMaxOpen:       10,
 			PoolMaxIdle:       2,
 			ONNXModel:         "ALL_MINILM_L12_V2",
+			AgentID:           "default",
+			EmbeddingProvider: "api",
+			EmbeddingAPIBase:  "",
+			EmbeddingAPIKey:   "",
+			EmbeddingModel:    "embedding-3",
+		},
+		Postgres: PostgresDBConfig{
+			Enabled:           false,
+			Host:              "localhost",
+			Port:              5432,
+			Database:          "picooraclaw",
+			User:              "postgres",
+			Password:          "",
+			SSLMode:           "disable",
+			PoolMaxOpen:       10,
+			PoolMaxIdle:       2,
 			AgentID:           "default",
 			EmbeddingProvider: "api",
 			EmbeddingAPIBase:  "",
